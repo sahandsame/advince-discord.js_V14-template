@@ -2,18 +2,26 @@ import { Collection, Events as DiscordEvents } from "discord.js";
 import { readdirSync } from "fs";
 import { join } from "path";
 import { watch } from "chokidar";
+import { createRequire } from "node:module";
 import { BotClient } from "@/base/Client";
+import { CommandModule, EventModule, HelperModule } from "@/types/base";
+
+// CJS require function that tsx intercepts — gives us require.cache for hot reload
+const cjsRequire = createRequire(join(process.cwd(), "src", "helper", "handler.ts"));
 
 export class Handler {
     events: Events;
     commands: Commands;
+    helpers: Helper;
     constructor() {
         this.events = new Events();
         this.commands = new Commands();
+        this.helpers = new Helper();
     }
     async setUp(client: BotClient): Promise<void> {
         await this.events.setUp(client);
         await this.commands.setUp(client);
+        await this.helpers.setUp(client);
     }
 }
 
@@ -32,7 +40,10 @@ class Events {
 
     private clearModuleCache(filePath: string): void {
         try {
-            delete require.cache[require.resolve(filePath)];
+            const resolved = cjsRequire.resolve(filePath);
+            if (cjsRequire.cache[resolved]) {
+                delete cjsRequire.cache[resolved];
+            }
         } catch {
             // Ignore cache clearing failures for files already removed on disk.
         }
@@ -73,10 +84,11 @@ class Events {
 
     async load(client: BotClient, filePath: string): Promise<void> {
         this.clearModuleCache(filePath);
-        const event: EventModule = require(filePath).default;
+        const mod = cjsRequire(filePath);
+        const event: EventModule = mod.default || mod;
 
         const listener = async (...args: any[]) => {
-            const cleanupResult = await Promise.resolve(event.execute(...args));
+            const cleanupResult = await Promise.resolve(event.execute(...args, client));
             const entry = this.listenerRegistry.get(filePath);
             if (!entry) return;
 
@@ -157,7 +169,10 @@ class Commands {
 
     private clearModuleCache(filePath: string): void {
         try {
-            delete require.cache[require.resolve(filePath)];
+            const resolved = cjsRequire.resolve(filePath);
+            if (cjsRequire.cache[resolved]) {
+                delete cjsRequire.cache[resolved];
+            }
         } catch {
             // Ignore cache clearing failures for files already removed on disk.
         }
@@ -190,7 +205,8 @@ class Commands {
         }
 
         this.clearModuleCache(filePath);
-        const command: CommandModule = require(filePath).default;
+        const mod = cjsRequire(filePath);
+        const command: CommandModule = mod.default || mod;
 
         this.collection.set(command.data.name, command);
         this.fileRegistry.set(filePath, {
@@ -238,5 +254,106 @@ class Commands {
         });
 
         console.log(`[commands] Watching ${this.path} for changes`);
+    }
+
+    async get(name: string): Promise<CommandModule | undefined> {
+        return this.collection.get(name);
+    }
+}
+
+class Helper {
+    path: string;
+    // Map to track loaded helpers by file path for cleanup
+    private helperRegistry = new Map<string, HelperModule>();
+
+    constructor() {
+        this.path = join(process.cwd(), "src", "helpers"); // Adjust path as needed
+    }
+
+    private clearModuleCache(filePath: string): void {
+        try {
+            const resolved = cjsRequire.resolve(filePath);
+            if (cjsRequire.cache[resolved]) {
+                delete cjsRequire.cache[resolved];
+            }
+        } catch { /* Ignore */ }
+    }
+
+    private async runCleanup(cleanup?: () => void | Promise<void>): Promise<void> {
+        if (!cleanup) return;
+        await Promise.resolve(cleanup());
+    }
+
+    async setUp(client: BotClient): Promise<void> {
+        await this.loadAll(client);
+        this.watch(client);
+    }
+
+    async loadAll(client: BotClient): Promise<void> {
+        // Support nested folders similar to Commands
+        const files = readdirSync(this.path, { recursive: true }) as string[];
+        for (const file of files) {
+            if (file.endsWith(".ts") || file.endsWith(".js")) {
+                await this.load(client, join(this.path, file));
+            }
+        }
+    }
+
+    async load(client: BotClient, filePath: string): Promise<void> {
+        // Prevent duplicates during watch events
+        if (this.helperRegistry.has(filePath)) {
+            await this.unload(client, filePath);
+        }
+
+        this.clearModuleCache(filePath);
+        const mod = cjsRequire(filePath);
+        const HelperClass = mod.default || mod;
+
+        // Check if the export is a valid constructor/class
+        if (typeof HelperClass === 'function') {
+            const instance = new HelperClass();
+            
+            // If helpers have an init/setUp method, call it
+            if (typeof instance.setUp === 'function') {
+                await instance.setUp(client);
+            }
+
+            this.helperRegistry.set(filePath, {
+                setUp: instance.setUp.bind(instance),
+                cleanup: instance.cleanup ? instance.cleanup.bind(instance) : undefined
+            });
+
+            console.log(`[helpers] Loaded: ${filePath}`);
+        }
+    }
+
+    async unload(client: BotClient, filePath: string): Promise<void> {
+        const entry = this.helperRegistry.get(filePath);
+        if (!entry) return;
+
+        // Run custom cleanup logic (e.g., closing DB connections, clearing intervals)
+        await this.runCleanup(entry.cleanup);
+        
+        this.helperRegistry.delete(filePath);
+        this.clearModuleCache(filePath);
+
+        console.log(`[helpers] Unloaded: ${filePath}`);
+    }
+
+    watch(client: BotClient): void {
+        const watcher = watch(this.path, { ignoreInitial: true });
+
+        watcher.on("add", (file) => this.load(client, file).catch(console.error));
+        watcher.on("change", async (file) => {
+            try {
+                await this.unload(client, file);
+                await this.load(client, file);
+            } catch (error) {
+                console.error(`[helpers] Failed to reload ${file}:`, error);
+            }
+        });
+        watcher.on("unlink", (file) => this.unload(client, file).catch(console.error));
+
+        console.log(`[helpers] Watching ${this.path} for changes`);
     }
 }

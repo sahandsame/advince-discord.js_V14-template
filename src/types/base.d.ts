@@ -1,3 +1,5 @@
+import { ApplicationCommandDataResolvable, ApplicationCommandOption } from "discord.js";
+
 type EventRuntimeCleanup = (() => void | Promise<void>) | NodeJS.Timeout | number | undefined;
 
 interface EventModule {
@@ -8,7 +10,12 @@ interface EventModule {
 }
 
 interface CommandModule {
-    data: { name: string };
+    data: { name: string, enable: boolean, guildOnly?: boolean, applicationCommandData?: ApplicationCommandDataResolvable };
     execute: (...args: any[]) => void | Promise<void>;
+    cleanup?: () => void | Promise<void>;
+}
+
+interface HelperModule {
+    setUp: (client: BotClient) => void | Promise<void>;
     cleanup?: () => void | Promise<void>;
 }
